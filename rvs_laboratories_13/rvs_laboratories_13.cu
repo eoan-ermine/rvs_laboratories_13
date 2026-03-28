@@ -17,10 +17,53 @@
   } while (0)
 
 __global__ void scan(float *input, float *output, int len) {
-  //@@ Модифицируйте тело функции так, чтобы достичь
-  //@@ функциональности префиксной свертки на устройстве
-  //@@ Вам может понадобиться несколько запусков ядра; напишите ваше ядро 
-  //@@ перед этой функцией и запустите его отсюда 
+  __shared__ float temp[BLOCK_SIZE * 2];
+
+  int tID = threadIdx.x;
+  int start = 2 * blockIdx.x * blockDim.x;
+
+  int i = start + tID;
+  int j = start + tID + blockDim.x;
+
+  temp[tID] = (i < len) ? input[i] : 0;
+  temp[tID + blockDim.x] = (j < len) ? input[j] : 0;
+
+  // Upsweep (редукция)
+  int offset = 1;
+  for (int d = blockDim.x; d > 0; d >>= 1) {
+    __syncthreads();
+    if (tID < d) {
+      int ai = offset * (2 * tID + 1) - 1;
+      int bi = offset * (2 * tID + 2) - 1;
+      temp[bi] += temp[ai];
+    }
+    offset <<= 1;
+  }
+
+  // Обнуляем последний элемент
+  if (tID == 0) {
+    temp[2 * blockDim.x - 1] = 0;
+  }
+
+  // Downsweep
+  for (int d = 1; d < 2 * blockDim.x; d <<= 1) {
+    offset >>= 1;
+    __syncthreads();
+    if (tID < d) {
+      int ai = offset * (2 * tID + 1) - 1;
+      int bi = offset * (2 * tID + 2) - 1;
+
+      float t = temp[ai];
+      temp[ai] = temp[bi];
+      temp[bi] += t;
+    }
+  }
+
+  __syncthreads();
+
+  // Запись результата
+  if (i < len) output[i] = temp[tID] + input[i];
+  if (j < len) output[j] = temp[tID + blockDim.x] + input[j];
 }
 
 int main(int argc, char **argv) {
@@ -56,11 +99,11 @@ int main(int argc, char **argv) {
   wbTime_stop(GPU, "Copying input memory to the GPU.");
 
   //@@ Инициализируйте размерности блоков и сетки
+  int threads = BLOCK_SIZE;
+  int blocks = (numElements + threads * 2 - 1) / (threads * 2);
 
   wbTime_start(Compute, "Performing CUDA computation");
-  //@@ Реализуйте префиксную сумму
-
-
+  scanKernel<<<blocks, threads>>>(deviceInput, deviceOutput, numElements);
   cudaDeviceSynchronize();
   wbTime_stop(Compute, "Performing CUDA computation");
 
