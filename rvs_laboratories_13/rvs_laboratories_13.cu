@@ -2,7 +2,7 @@
 // Результатом является префиксная сумма = {lst[0], lst[0] + lst[1],
 // lst[0] + lst[1] + ... + lst[n-1]}
 
-#include <wb.h>
+#include "wb.h"
 
 #define BLOCK_SIZE 512 //@@ Это можно поменять
 
