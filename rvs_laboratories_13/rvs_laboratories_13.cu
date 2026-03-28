@@ -7,63 +7,79 @@
 #define BLOCK_SIZE 512 //@@ Это можно поменять
 
 #define wbCheck(stmt)                                                     \
-  do {                                                                    \
-    cudaError_t err = stmt;                                               \
-    if (err != cudaSuccess) {                                             \
-      wbLog(ERROR, "Failed to run stmt ", #stmt);                         \
-      wbLog(ERROR, "Got CUDA error ...  ", cudaGetErrorString(err));      \
-      return -1;                                                          \
-    }                                                                     \
-  } while (0)
+do {                                                                    \
+  cudaError_t err = stmt;                                               \
+  if (err != cudaSuccess) {                                             \
+    wbLog(ERROR, "Failed to run stmt ", #stmt);                         \
+    wbLog(ERROR, "Got CUDA error ...  ", cudaGetErrorString(err));      \
+    return -1;                                                          \
+  }                                                                     \
+} while (0)
 
-__global__ void scan(float *input, float *output, int len) {
-  __shared__ float temp[BLOCK_SIZE * 2];
+__global__ void addBlockSums(float *output, float *partialSums, int len) {
+  int tID = threadIdx.x;
+  int bID = blockIdx.x;
+  int start = 2 * bID * blockDim.x;
+  int offset = 2 * tID;
+
+  float sum = (bID > 0) ? partialSums[bID - 1] : 0.0f;
+
+  if (start + offset < len) {
+    output[start + offset] += sum;
+  }
+  if (start + offset + 1 < len) {
+    output[start + offset + 1] += sum;
+  }
+}
+
+__global__ void scan(float *input, float *output, float *partialSums, int len) {
+  extern __shared__ float temp[];
 
   int tID = threadIdx.x;
-  int start = 2 * blockIdx.x * blockDim.x;
+  int bID = blockIdx.x;
+  int start = 2 * bID * blockDim.x;
+  int offset = 2 * tID;
 
-  int i = start + tID;
-  int j = start + tID + blockDim.x;
-
-  temp[tID] = (i < len) ? input[i] : 0;
-  temp[tID + blockDim.x] = (j < len) ? input[j] : 0;
-
-  // Upsweep (редукция)
-  int offset = 1;
-  for (int d = blockDim.x; d > 0; d >>= 1) {
-    __syncthreads();
-    if (tID < d) {
-      int ai = offset * (2 * tID + 1) - 1;
-      int bi = offset * (2 * tID + 2) - 1;
-      temp[bi] += temp[ai];
-    }
-    offset <<= 1;
-  }
-
-  // Обнуляем последний элемент
-  if (tID == 0) {
-    temp[2 * blockDim.x - 1] = 0;
-  }
-
-  // Downsweep
-  for (int d = 1; d < 2 * blockDim.x; d <<= 1) {
-    offset >>= 1;
-    __syncthreads();
-    if (tID < d) {
-      int ai = offset * (2 * tID + 1) - 1;
-      int bi = offset * (2 * tID + 2) - 1;
-
-      float t = temp[ai];
-      temp[ai] = temp[bi];
-      temp[bi] += t;
-    }
-  }
+  temp[offset] = (start + offset < len) ? input[start + offset] : 0.0f;
+  temp[offset + 1] = (start + offset + 1 < len) ? input[start + offset + 1] : 0.0f;
 
   __syncthreads();
 
-  // Запись результата
-  if (i < len) output[i] = temp[tID] + input[i];
-  if (j < len) output[j] = temp[tID + blockDim.x] + input[j];
+  for (int d = 1; d <= blockDim.x; d *= 2) {
+    int index = 2 * d * (tID + 1) - 1;
+    if (index < 2 * blockDim.x) {
+      temp[index] += temp[index - d];
+    }
+    __syncthreads();
+  }
+
+  if (partialSums != NULL) {
+    if (tID == 0) {
+      partialSums[bID] = temp[2 * blockDim.x - 1];
+    }
+  }
+
+  if (tID == 0) {
+    temp[2 * blockDim.x - 1] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int d = blockDim.x; d >= 1; d /= 2) {
+    int index = 2 * d * (tID + 1) - 1;
+    if (index < 2 * blockDim.x) {
+      float t = temp[index - d];
+      temp[index - d] = temp[index];
+      temp[index] += t;
+    }
+    __syncthreads();
+  }
+
+  if (start + offset < len) {
+    output[start + offset] = temp[offset] + input[start + offset];
+  }
+  if (start + offset + 1 < len) {
+    output[start + offset + 1] = temp[offset + 1] + input[start + offset + 1];
+  }
 }
 
 int main(int argc, char **argv) {
@@ -72,6 +88,7 @@ int main(int argc, char **argv) {
   float *hostOutput; // Выходной список
   float *deviceInput;
   float *deviceOutput;
+  float *devicePartialSums; // Массив для хранения сумм блоков
   int numElements; // количество элементов в списке
 
   args = wbArg_read(argc, argv);
@@ -98,12 +115,21 @@ int main(int argc, char **argv) {
                      cudaMemcpyHostToDevice));
   wbTime_stop(GPU, "Copying input memory to the GPU.");
 
-  //@@ Инициализируйте размерности блоков и сетки
-  int threads = BLOCK_SIZE;
-  int blocks = (numElements + threads * 2 - 1) / (threads * 2);
+  dim3 dimBlock(BLOCK_SIZE, 1);
+  int numBlocks = (numElements + 2 * BLOCK_SIZE - 1) / (2 * BLOCK_SIZE);
+  dim3 dimGrid(numBlocks, 1);
+  size_t sharedMemSize = 2 * BLOCK_SIZE * sizeof(float);
+
+  wbCheck(cudaMalloc((void **)&devicePartialSums, numBlocks * sizeof(float)));
 
   wbTime_start(Compute, "Performing CUDA computation");
-  scanKernel<<<blocks, threads>>>(deviceInput, deviceOutput, numElements);
+  scan<<<dimGrid, dimBlock, sharedMemSize>>>(deviceInput, deviceOutput, devicePartialSums, numElements);
+
+  if (numBlocks > 1) {
+    scan<<<dim3(1,1), dimBlock, sharedMemSize>>>(devicePartialSums, devicePartialSums, NULL, numBlocks);
+    addBlockSums<<<dimGrid, dimBlock>>>(deviceOutput, devicePartialSums, numElements);
+  }
+
   cudaDeviceSynchronize();
   wbTime_stop(Compute, "Performing CUDA computation");
 
@@ -115,6 +141,7 @@ int main(int argc, char **argv) {
   wbTime_start(GPU, "Freeing GPU Memory");
   cudaFree(deviceInput);
   cudaFree(deviceOutput);
+  cudaFree(devicePartialSums);
   wbTime_stop(GPU, "Freeing GPU Memory");
 
   wbSolution(args, hostOutput, numElements);
